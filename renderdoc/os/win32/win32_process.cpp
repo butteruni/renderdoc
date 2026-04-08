@@ -35,6 +35,7 @@
 #include "strings/string_utils.h"
 
 #include <string>
+#include <map>
 
 static rdcarray<EnvironmentModification> &GetEnvModifications()
 {
@@ -292,10 +293,31 @@ static bool InjectDLL_CreateRemoteThread(HANDLE hProcess, const wchar_t *dllPath
   return true;
 }
 
+// 记录每个进程的主线程 ID，避免 LoadLibraryW 后新线程干扰查找
+static std::map<DWORD, DWORD> s_MainThreadIds;
+
 // 查找目标进程的主线程句柄（用于 SetThreadContext 注入）
 // 返回的线程保证处于挂起状态（挂起计数 >= 1）
+// 如果之前已经记录了该进程的主线程 ID，则直接使用，
+// 避免 LoadLibraryW 创建新线程后找错线程。
 static HANDLE FindMainThread(DWORD pid)
 {
+  // 如果已经记录了主线程 ID，直接打开它
+  auto it = s_MainThreadIds.find(pid);
+  if(it != s_MainThreadIds.end())
+  {
+    HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                                FALSE, it->second);
+    if(hThread)
+    {
+      SuspendThread(hThread);
+      RDCLOG("Reusing known main thread %u for process %u", it->second, pid);
+      return hThread;
+    }
+    // 如果打开失败（线程已退出），清除记录，走下面的查找逻辑
+    s_MainThreadIds.erase(it);
+  }
+
   HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
   if(hSnapshot == INVALID_HANDLE_VALUE)
     return NULL;
@@ -332,6 +354,8 @@ static HANDLE FindMainThread(DWORD pid)
     // SuspendThread 也只是增加挂起计数，不会出错。
     // 后续需要对应的 ResumeThread 来抵消这次挂起。
     SuspendThread(hThread);
+    // 记录主线程 ID，后续 InjectFunctionCall 可以直接使用
+    s_MainThreadIds[pid] = earliestThread;
     RDCLOG("Found and suspended main thread %u for process %u", earliestThread, pid);
   }
 
@@ -1894,6 +1918,9 @@ rdcpair<RDResult, uint32_t> Process::InjectIntoProcess(uint32_t pid,
 
   if(hProcess)
     CloseHandle(hProcess);
+
+  // 清理主线程 ID 记录，注入流程已完成
+  s_MainThreadIds.erase(pid);
 
   return result;
 }
