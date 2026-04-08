@@ -249,50 +249,556 @@ extern "C" __declspec(dllexport) void __cdecl INTERNAL_ApplyEnvMods(void *ignore
   Process::ApplyEnvironmentModification();
 }
 
-void InjectDLL(HANDLE hProcess, rdcwstr libName)
+// 通过 CreateRemoteThread 方式注入 DLL（传统方式）
+static bool InjectDLL_CreateRemoteThread(HANDLE hProcess, const wchar_t *dllPath, size_t dllPathSize)
 {
-  wchar_t dllPath[MAX_PATH + 1] = {0};
-  wcscpy_s(dllPath, libName.c_str());
-
   static HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
 
   if(kernel32 == NULL)
   {
     RDCERR("Couldn't get handle for kernel32.dll");
-    return;
+    return false;
   }
 
   void *remoteMem =
-      VirtualAllocEx(hProcess, NULL, sizeof(dllPath), MEM_COMMIT, PAGE_EXECUTE_READWRITE);
-  if(remoteMem)
+      VirtualAllocEx(hProcess, NULL, dllPathSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteMem)
   {
-    BOOL success = WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, sizeof(dllPath), NULL);
-    if(success)
-    {
-      HANDLE hThread = CreateRemoteThread(
-          hProcess, NULL, 1024 * 1024U,
-          (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"), remoteMem, 0, NULL);
-      if(hThread)
-      {
-        WaitForSingleObject(hThread, INFINITE);
-        CloseHandle(hThread);
-      }
-      else
-      {
-        RDCERR("Couldn't create remote thread for LoadLibraryW: %u", GetLastError());
-      }
-    }
-    else
-    {
-      RDCERR("Couldn't write remote memory %p with dllPath '%ls': %u", remoteMem, dllPath,
-             GetLastError());
-    }
-
-    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    RDCERR("Couldn't allocate remote memory for DLL: %u", GetLastError());
+    return false;
   }
-  else
+
+  BOOL success = WriteProcessMemory(hProcess, remoteMem, (void *)dllPath, dllPathSize, NULL);
+  if(!success)
   {
-    RDCERR("Couldn't allocate remote memory for DLL '%ls': %u", libName.c_str(), GetLastError());
+    RDCERR("Couldn't write remote memory %p with dllPath: %u", remoteMem, GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    return false;
+  }
+
+  HANDLE hThread = CreateRemoteThread(
+      hProcess, NULL, 1024 * 1024U,
+      (LPTHREAD_START_ROUTINE)GetProcAddress(kernel32, "LoadLibraryW"), remoteMem, 0, NULL);
+  if(!hThread)
+  {
+    RDCERR("Couldn't create remote thread for LoadLibraryW: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    return false;
+  }
+
+  WaitForSingleObject(hThread, INFINITE);
+  CloseHandle(hThread);
+  VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+  return true;
+}
+
+// 查找目标进程的主线程句柄（用于 SetThreadContext 注入）
+// 返回的线程保证处于挂起状态（挂起计数 >= 1）
+static HANDLE FindMainThread(DWORD pid)
+{
+  HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+  if(hSnapshot == INVALID_HANDLE_VALUE)
+    return NULL;
+
+  THREADENTRY32 te32;
+  te32.dwSize = sizeof(THREADENTRY32);
+
+  HANDLE hThread = NULL;
+  DWORD earliestThread = 0;
+
+  if(Thread32First(hSnapshot, &te32))
+  {
+    do
+    {
+      if(te32.th32OwnerProcessID == pid)
+      {
+        // 取第一个找到的线程（通常是主线程）
+        if(hThread == NULL)
+        {
+          hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME,
+                               FALSE, te32.th32ThreadID);
+          earliestThread = te32.th32ThreadID;
+        }
+      }
+    } while(Thread32Next(hSnapshot, &te32));
+  }
+
+  CloseHandle(hSnapshot);
+
+  if(hThread)
+  {
+    // 显式挂起线程，确保 GetThreadContext/SetThreadContext 能正确工作。
+    // 即使线程已经是挂起状态（如 CREATE_SUSPENDED 创建的进程），
+    // SuspendThread 也只是增加挂起计数，不会出错。
+    // 后续需要对应的 ResumeThread 来抵消这次挂起。
+    SuspendThread(hThread);
+    RDCLOG("Found and suspended main thread %u for process %u", earliestThread, pid);
+  }
+
+  return hThread;
+}
+
+// 通过 SetThreadContext 方式注入 DLL（劫持挂起线程的方式）
+// 原理：修改挂起线程的指令指针，使其先执行我们的 shellcode（调用 LoadLibraryW），
+// 然后跳回原始的指令地址继续执行。
+// 使用标志位（flag）同步：shellcode 在 LoadLibraryW 完成后写入标志位，注入方轮询检查。
+//
+// 改进：shellcode 会保存/恢复所有被修改的寄存器，确保跳回原始 IP 时寄存器状态完整。
+// shellcode 在设置完成标志后会调用 SuspendThread(-2) 挂起自身，
+// 避免外部竞态挂起导致的死锁问题。
+static bool InjectDLL_SetThreadContext(HANDLE hProcess, DWORD pid, const wchar_t *dllPath,
+                                       size_t dllPathSize)
+{
+  // 查找目标进程的主线程（FindMainThread 会确保线程处于挂起状态）
+  HANDLE hThread = FindMainThread(pid);
+  if(!hThread)
+  {
+    RDCWARN("SetThreadContext injection: couldn't find main thread for process %u", pid);
+    return false;
+  }
+
+  static HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  if(kernel32 == NULL)
+  {
+    RDCERR("Couldn't get handle for kernel32.dll");
+    CloseHandle(hThread);
+    return false;
+  }
+
+  void *pLoadLibraryW = (void *)GetProcAddress(kernel32, "LoadLibraryW");
+  if(!pLoadLibraryW)
+  {
+    RDCERR("Couldn't get address of LoadLibraryW");
+    CloseHandle(hThread);
+    return false;
+  }
+
+  // 获取 GetCurrentThread 和 SuspendThread 的地址，
+  // shellcode 将调用 SuspendThread(GetCurrentThread()) 来安全地挂起自身。
+  void *pGetCurrentThread = (void *)GetProcAddress(kernel32, "GetCurrentThread");
+  void *pSuspendThread = (void *)GetProcAddress(kernel32, "SuspendThread");
+  if(!pGetCurrentThread || !pSuspendThread)
+  {
+    RDCERR("Couldn't get address of GetCurrentThread/SuspendThread");
+    CloseHandle(hThread);
+    return false;
+  }
+
+  // 获取线程上下文
+  CONTEXT ctx = {};
+  ctx.ContextFlags = CONTEXT_FULL;
+  if(!GetThreadContext(hThread, &ctx))
+  {
+    RDCERR("SetThreadContext injection: GetThreadContext failed: %u", GetLastError());
+    CloseHandle(hThread);
+    return false;
+  }
+
+#if ENABLED(RDOC_X64)
+  DWORD64 origIP = ctx.Rip;
+  DWORD64 origRCX = ctx.Rcx;
+  DWORD64 origRDX = ctx.Rdx;
+  DWORD64 origR8 = ctx.R8;
+  DWORD64 origR9 = ctx.R9;
+  DWORD64 origR10 = ctx.R10;
+  DWORD64 origR11 = ctx.R11;
+  DWORD64 origRAX = ctx.Rax;
+#else
+  DWORD origIP = ctx.Eip;
+#endif
+
+  // 内存布局：
+  //   [shellcode 代码] [DLL 路径字符串] [完成标志 DWORD，初始为 0] [保存的上下文数据]
+  //
+  // shellcode 的功能：
+  // 1. 保存所有易失性寄存器到栈上
+  // 2. 调用 LoadLibraryW(dllPath)
+  // 3. 将完成标志设为 1（通知注入方 LoadLibraryW 已完成）
+  // 4. 调用 SuspendThread(GetCurrentThread()) 挂起自身
+  // 5. 恢复所有寄存器
+  // 6. 跳回原始指令地址
+
+#if ENABLED(RDOC_X64)
+  // x64 shellcode（改进版）:
+  // 保存所有易失性寄存器，调用 LoadLibraryW，设置标志，
+  // 调用 SuspendThread(GetCurrentThread()) 挂起自身，
+  // 恢复寄存器后跳回原始 IP。
+  //
+  // 当外部检测到标志位为 1 后，调用 ResumeThread 恢复线程，
+  // 线程从 SuspendThread 返回后继续执行恢复寄存器和跳回的代码。
+
+  // 预估 shellcode 大小（宽裕估计）
+  const size_t shellcodeMaxSize = 256;
+  const size_t flagOffset = shellcodeMaxSize + dllPathSize;
+  const size_t flagOffsetAligned = (flagOffset + 7) & ~(size_t)7;
+  const size_t totalSize = flagOffsetAligned + sizeof(DWORD);
+
+  void *remoteMem =
+      VirtualAllocEx(hProcess, NULL, totalSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteMem)
+  {
+    RDCERR("SetThreadContext injection: couldn't allocate remote memory: %u", GetLastError());
+    CloseHandle(hThread);
+    return false;
+  }
+
+  BYTE *shellcode = new BYTE[totalSize];
+  memset(shellcode, 0, totalSize);
+
+  size_t offset = 0;
+  BYTE *sc = shellcode;
+
+  DWORD64 dllPathAddr = (DWORD64)remoteMem + shellcodeMaxSize;
+  DWORD64 flagAddr = (DWORD64)remoteMem + flagOffsetAligned;
+
+  // === 保存易失性寄存器 ===
+  // push rax
+  sc[offset++] = 0x50;
+  // push rcx
+  sc[offset++] = 0x51;
+  // push rdx
+  sc[offset++] = 0x52;
+  // push r8
+  sc[offset++] = 0x41; sc[offset++] = 0x50;
+  // push r9
+  sc[offset++] = 0x41; sc[offset++] = 0x51;
+  // push r10
+  sc[offset++] = 0x41; sc[offset++] = 0x52;
+  // push r11
+  sc[offset++] = 0x41; sc[offset++] = 0x53;
+
+  // === 调用 LoadLibraryW ===
+  // sub rsp, 0x28 (影子空间 + 对齐)
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xEC; sc[offset++] = 0x28;
+
+  // mov rcx, <dllPathAddr>
+  sc[offset++] = 0x48; sc[offset++] = 0xB9;
+  memcpy(&sc[offset], &dllPathAddr, 8); offset += 8;
+
+  // mov rax, <LoadLibraryW>
+  DWORD64 loadLibAddr = (DWORD64)pLoadLibraryW;
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &loadLibAddr, 8); offset += 8;
+
+  // call rax
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // add rsp, 0x28
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xC4; sc[offset++] = 0x28;
+
+  // === 设置完成标志 ===
+  // mov rax, <flagAddr>
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &flagAddr, 8); offset += 8;
+
+  // mov dword ptr [rax], 1
+  sc[offset++] = 0xC7; sc[offset++] = 0x00;
+  DWORD one = 1;
+  memcpy(&sc[offset], &one, 4); offset += 4;
+
+  // === 调用 SuspendThread(GetCurrentThread()) 挂起自身 ===
+  // sub rsp, 0x28
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xEC; sc[offset++] = 0x28;
+
+  // mov rax, <GetCurrentThread>
+  DWORD64 getCurrentThreadAddr = (DWORD64)pGetCurrentThread;
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &getCurrentThreadAddr, 8); offset += 8;
+
+  // call rax  ; rax = GetCurrentThread() 返回伪句柄
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // mov rcx, rax  ; SuspendThread 的参数
+  sc[offset++] = 0x48; sc[offset++] = 0x89; sc[offset++] = 0xC1;
+
+  // mov rax, <SuspendThread>
+  DWORD64 suspendThreadAddr = (DWORD64)pSuspendThread;
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &suspendThreadAddr, 8); offset += 8;
+
+  // call rax  ; SuspendThread(GetCurrentThread()) - 线程在此挂起
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // add rsp, 0x28
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xC4; sc[offset++] = 0x28;
+
+  // === 线程被 ResumeThread 恢复后从这里继续 ===
+  // === 恢复易失性寄存器 ===
+  // pop r11
+  sc[offset++] = 0x41; sc[offset++] = 0x5B;
+  // pop r10
+  sc[offset++] = 0x41; sc[offset++] = 0x5A;
+  // pop r9
+  sc[offset++] = 0x41; sc[offset++] = 0x59;
+  // pop r8
+  sc[offset++] = 0x41; sc[offset++] = 0x58;
+  // pop rdx
+  sc[offset++] = 0x5A;
+  // pop rcx
+  sc[offset++] = 0x59;
+  // pop rax
+  sc[offset++] = 0x58;
+
+  // === 跳回原始 IP ===
+  // 使用 push + ret 的方式跳转，避免破坏任何寄存器
+  // push <origIP_low32>  ; 先压入低32位（会被符号扩展）
+  // mov dword ptr [rsp+4], <origIP_high32>  ; 修正高32位
+  // ret
+  DWORD origIP_low = (DWORD)(origIP & 0xFFFFFFFF);
+  DWORD origIP_high = (DWORD)(origIP >> 32);
+
+  // push imm32 (低32位，会被符号扩展到64位)
+  sc[offset++] = 0x68;
+  memcpy(&sc[offset], &origIP_low, 4); offset += 4;
+
+  // mov dword ptr [rsp+4], imm32 (修正高32位)
+  sc[offset++] = 0xC7; sc[offset++] = 0x44; sc[offset++] = 0x24; sc[offset++] = 0x04;
+  memcpy(&sc[offset], &origIP_high, 4); offset += 4;
+
+  // ret
+  sc[offset++] = 0xC3;
+
+  RDCASSERT(offset <= shellcodeMaxSize, offset, shellcodeMaxSize);
+
+  // 复制 DLL 路径到 shellcode 代码之后
+  memcpy(&sc[shellcodeMaxSize], dllPath, dllPathSize);
+
+  void *remoteFlagAddr = (BYTE *)remoteMem + flagOffsetAligned;
+
+#else
+  // x86 shellcode（改进版）:
+  // 保存所有寄存器，调用 LoadLibraryW，设置标志，
+  // 调用 SuspendThread(GetCurrentThread()) 挂起自身，
+  // 恢复寄存器后跳回原始 IP。
+
+  const size_t shellcodeMaxSize = 128;
+  const size_t flagOffset = shellcodeMaxSize + dllPathSize;
+  const size_t flagOffsetAligned = (flagOffset + 3) & ~(size_t)3;
+  const size_t totalSize = flagOffsetAligned + sizeof(DWORD);
+
+  void *remoteMem =
+      VirtualAllocEx(hProcess, NULL, totalSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteMem)
+  {
+    RDCERR("SetThreadContext injection: couldn't allocate remote memory: %u", GetLastError());
+    CloseHandle(hThread);
+    return false;
+  }
+
+  BYTE *shellcode = new BYTE[totalSize];
+  memset(shellcode, 0, totalSize);
+
+  size_t offset = 0;
+  BYTE *sc = shellcode;
+
+  DWORD dllPathAddr = (DWORD)((uintptr_t)remoteMem + shellcodeMaxSize);
+  DWORD flagAddr = (DWORD)((uintptr_t)remoteMem + flagOffsetAligned);
+
+  // === 保存所有通用寄存器 ===
+  // pushad
+  sc[offset++] = 0x60;
+  // pushfd
+  sc[offset++] = 0x9C;
+
+  // === 调用 LoadLibraryW ===
+  // push <dllPathAddr>
+  sc[offset++] = 0x68;
+  memcpy(&sc[offset], &dllPathAddr, 4); offset += 4;
+
+  // mov eax, <LoadLibraryW>
+  DWORD loadLibAddr = (DWORD)(uintptr_t)pLoadLibraryW;
+  sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &loadLibAddr, 4); offset += 4;
+
+  // call eax
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // === 设置完成标志 ===
+  // mov dword ptr [<flagAddr>], 1
+  sc[offset++] = 0xC7; sc[offset++] = 0x05;
+  memcpy(&sc[offset], &flagAddr, 4); offset += 4;
+  DWORD one = 1;
+  memcpy(&sc[offset], &one, 4); offset += 4;
+
+  // === 调用 SuspendThread(GetCurrentThread()) 挂起自身 ===
+  // call GetCurrentThread
+  DWORD getCurrentThreadAddrX86 = (DWORD)(uintptr_t)pGetCurrentThread;
+  sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &getCurrentThreadAddrX86, 4); offset += 4;
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // push eax  ; GetCurrentThread() 返回值作为 SuspendThread 参数
+  sc[offset++] = 0x50;
+
+  // call SuspendThread
+  DWORD suspendThreadAddrX86 = (DWORD)(uintptr_t)pSuspendThread;
+  sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &suspendThreadAddrX86, 4); offset += 4;
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // === 线程被 ResumeThread 恢复后从这里继续 ===
+  // === 恢复所有寄存器 ===
+  // popfd
+  sc[offset++] = 0x9D;
+  // popad
+  sc[offset++] = 0x61;
+
+  // === 跳回原始 IP ===
+  // push <origIP> + ret（不破坏任何寄存器）
+  sc[offset++] = 0x68;
+  memcpy(&sc[offset], &origIP, 4); offset += 4;
+  sc[offset++] = 0xC3;
+
+  RDCASSERT(offset <= shellcodeMaxSize, offset, shellcodeMaxSize);
+
+  // 复制 DLL 路径到 shellcode 代码之后
+  memcpy(&sc[shellcodeMaxSize], dllPath, dllPathSize);
+
+  void *remoteFlagAddr = (BYTE *)remoteMem + flagOffsetAligned;
+
+#endif
+
+  // 写入 shellcode 到远程进程
+  BOOL success = WriteProcessMemory(hProcess, remoteMem, shellcode, totalSize, NULL);
+  delete[] shellcode;
+
+  if(!success)
+  {
+    RDCERR("SetThreadContext injection: couldn't write shellcode to remote memory: %u",
+           GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    CloseHandle(hThread);
+    return false;
+  }
+
+  // 修改线程上下文，将指令指针指向 shellcode
+#if ENABLED(RDOC_X64)
+  ctx.Rip = (DWORD64)remoteMem;
+#else
+  ctx.Eip = (DWORD)(uintptr_t)remoteMem;
+#endif
+
+  if(!SetThreadContext(hThread, &ctx))
+  {
+    RDCERR("SetThreadContext injection: SetThreadContext failed: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    CloseHandle(hThread);
+    return false;
+  }
+
+  RDCLOG("SetThreadContext injection: successfully hijacked thread, shellcode at %p, "
+         "original IP at %p, flag at %p",
+         remoteMem, (void *)(uintptr_t)origIP, remoteFlagAddr);
+
+  // 恢复线程执行 shellcode。
+  // FindMainThread 中做了一次 SuspendThread，这里需要两次 ResumeThread：
+  // 第一次抵消 FindMainThread 的挂起，第二次抵消 CREATE_SUSPENDED 的挂起。
+  // 但如果是 InjectIntoProcess（非 CREATE_SUSPENDED 场景），
+  // 线程可能只有一层挂起，所以我们只 Resume 到线程真正运行为止。
+  DWORD suspCount;
+  do {
+    suspCount = ResumeThread(hThread);
+  } while(suspCount > 1);
+
+  // 等待 DLL 加载完成。
+  // shellcode 在 LoadLibraryW 返回后会将标志位设为 1，然后调用 SuspendThread 挂起自身。
+  // 我们轮询读取标志位来判断 LoadLibraryW 是否已完成。
+  const DWORD timeout = 30000;    // 30 秒超时（DLL 加载可能较慢）
+  DWORD elapsed = 0;
+  bool loaded = false;
+
+  while(elapsed < timeout)
+  {
+    Sleep(50);
+    elapsed += 50;
+
+    // 从远程进程读取标志位
+    DWORD flagValue = 0;
+    SIZE_T bytesRead = 0;
+    if(ReadProcessMemory(hProcess, remoteFlagAddr, &flagValue, sizeof(flagValue), &bytesRead))
+    {
+      if(flagValue == 1)
+      {
+        loaded = true;
+        RDCLOG("SetThreadContext injection: LoadLibraryW completed (waited %u ms)", elapsed);
+        break;
+      }
+    }
+  }
+
+  if(!loaded)
+  {
+    RDCWARN("SetThreadContext injection: timed out waiting for LoadLibraryW to complete (%u ms)",
+            timeout);
+  }
+
+  // shellcode 在设置标志后调用了 SuspendThread(GetCurrentThread()) 挂起自身。
+  // 线程现在处于挂起状态，等待外部 ResumeThread。
+  //
+  // 我们需要通过 SetThreadContext 恢复线程的原始上下文（IP 和寄存器），
+  // 这样后续的 InjectFunctionCall 获取到的上下文是正确的原始状态，
+  // 而不是 shellcode 中 SuspendThread 返回后的位置。
+  if(loaded)
+  {
+    // 线程已经挂起（shellcode 自己挂起的），可以直接操作上下文
+    CONTEXT restoreCtx = {};
+    restoreCtx.ContextFlags = CONTEXT_FULL;
+    if(GetThreadContext(hThread, &restoreCtx))
+    {
+#if ENABLED(RDOC_X64)
+      restoreCtx.Rip = origIP;
+      restoreCtx.Rcx = origRCX;
+      restoreCtx.Rdx = origRDX;
+      restoreCtx.R8 = origR8;
+      restoreCtx.R9 = origR9;
+      restoreCtx.R10 = origR10;
+      restoreCtx.R11 = origR11;
+      restoreCtx.Rax = origRAX;
+      restoreCtx.Rsp = ctx.Rsp;
+#else
+      restoreCtx.Eip = origIP;
+      restoreCtx.Eax = ctx.Eax;
+      restoreCtx.Ecx = ctx.Ecx;
+      restoreCtx.Edx = ctx.Edx;
+      restoreCtx.Ebx = ctx.Ebx;
+      restoreCtx.Esp = ctx.Esp;
+      restoreCtx.Ebp = ctx.Ebp;
+      restoreCtx.Esi = ctx.Esi;
+      restoreCtx.Edi = ctx.Edi;
+#endif
+      SetThreadContext(hThread, &restoreCtx);
+    }
+  }
+
+  // 注意：不释放 remoteMem，因为进程退出时会自动释放。
+
+  CloseHandle(hThread);
+  return loaded;
+}
+
+void InjectDLL(HANDLE hProcess, rdcwstr libName)
+{
+  wchar_t dllPath[MAX_PATH + 1] = {0};
+  wcscpy_s(dllPath, libName.c_str());
+
+  DWORD pid = GetProcessId(hProcess);
+
+  // 首先尝试 SetThreadContext 注入方式
+  // 这种方式不创建新线程，而是劫持已有的挂起线程来执行 LoadLibraryW，
+  // 可以绕过某些反作弊系统对 CreateRemoteThread 的拦截。
+  RDCLOG("Attempting SetThreadContext injection for process %u", pid);
+  if(InjectDLL_SetThreadContext(hProcess, pid, dllPath, sizeof(dllPath)))
+  {
+    RDCLOG("SetThreadContext injection succeeded for process %u", pid);
+    return;
+  }
+
+  // SetThreadContext 方式失败，回退到 CreateRemoteThread 方式
+  RDCWARN("SetThreadContext injection failed, falling back to CreateRemoteThread for process %u",
+          pid);
+  if(!InjectDLL_CreateRemoteThread(hProcess, dllPath, sizeof(dllPath)))
+  {
+    RDCERR("All injection methods failed for process %u", pid);
   }
 }
 
@@ -398,6 +904,9 @@ uintptr_t FindRemoteDLL(DWORD pid, rdcstr libName)
   return ret;
 }
 
+// 通过 SetThreadContext 方式调用远程函数（替代 CreateRemoteThread）
+// 原理：劫持目标进程的挂起线程，让其执行 shellcode 来调用指定函数，
+// 函数执行完毕后 shellcode 会挂起自身，等待外部恢复。
 void InjectFunctionCall(HANDLE hProcess, uintptr_t renderdoc_remote, const char *funcName,
                         void *data, const size_t dataLen)
 {
@@ -418,18 +927,351 @@ void InjectFunctionCall(HANDLE hProcess, uintptr_t renderdoc_remote, const char 
   // in the remote module (which might be loaded at a different base address
   uintptr_t func_remote = func_local + renderdoc_remote - (uintptr_t)renderdoc_local;
 
-  void *remoteMem = VirtualAllocEx(hProcess, NULL, dataLen, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  DWORD pid = GetProcessId(hProcess);
+
+  // 查找主线程（FindMainThread 会确保线程处于挂起状态）
+  HANDLE hThread = FindMainThread(pid);
+  if(!hThread)
+  {
+    RDCERR("InjectFunctionCall: couldn't find main thread for process %u, "
+           "falling back to CreateRemoteThread", pid);
+    // 回退到 CreateRemoteThread
+    void *remoteMem = VirtualAllocEx(hProcess, NULL, dataLen, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    SIZE_T numWritten;
+    WriteProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten);
+    HANDLE hRemoteThread =
+        CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)func_remote, remoteMem, 0, NULL);
+    if(hRemoteThread)
+    {
+      WaitForSingleObject(hRemoteThread, INFINITE);
+      ReadProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten);
+      CloseHandle(hRemoteThread);
+    }
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    return;
+  }
+
+  static HMODULE kernel32 = GetModuleHandleA("kernel32.dll");
+  void *pGetCurrentThread = (void *)GetProcAddress(kernel32, "GetCurrentThread");
+  void *pSuspendThread = (void *)GetProcAddress(kernel32, "SuspendThread");
+
+  // 获取线程上下文
+  CONTEXT ctx = {};
+  ctx.ContextFlags = CONTEXT_FULL;
+  if(!GetThreadContext(hThread, &ctx))
+  {
+    RDCERR("InjectFunctionCall: GetThreadContext failed: %u", GetLastError());
+    ResumeThread(hThread);    // 抵消 FindMainThread 的挂起
+    CloseHandle(hThread);
+    return;
+  }
+
+#if ENABLED(RDOC_X64)
+  DWORD64 origIP = ctx.Rip;
+#else
+  DWORD origIP = ctx.Eip;
+#endif
+
+  // 写入函数参数数据到远程进程
+  void *remoteData = VirtualAllocEx(hProcess, NULL, dataLen, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteData)
+  {
+    RDCERR("InjectFunctionCall: couldn't allocate remote memory for data: %u", GetLastError());
+    ResumeThread(hThread);
+    CloseHandle(hThread);
+    return;
+  }
   SIZE_T numWritten;
-  WriteProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten);
+  WriteProcessMemory(hProcess, remoteData, data, dataLen, &numWritten);
 
-  HANDLE hThread =
-      CreateRemoteThread(hProcess, NULL, 0, (LPTHREAD_START_ROUTINE)func_remote, remoteMem, 0, NULL);
-  WaitForSingleObject(hThread, INFINITE);
+#if ENABLED(RDOC_X64)
+  // x64 shellcode:
+  // 保存易失性寄存器 -> 调用 func_remote(remoteData) -> 设置完成标志 ->
+  // SuspendThread(GetCurrentThread()) -> 恢复寄存器 -> 跳回原始 IP
+  const size_t shellcodeMaxSize = 256;
+  const size_t flagOffsetAligned = (shellcodeMaxSize + 7) & ~(size_t)7;
+  const size_t totalSize = flagOffsetAligned + sizeof(DWORD);
 
-  ReadProcessMemory(hProcess, remoteMem, data, dataLen, &numWritten);
+  void *remoteMem = VirtualAllocEx(hProcess, NULL, totalSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteMem)
+  {
+    RDCERR("InjectFunctionCall: couldn't allocate remote memory for shellcode: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteData, 0, MEM_RELEASE);
+    ResumeThread(hThread);
+    CloseHandle(hThread);
+    return;
+  }
 
-  CloseHandle(hThread);
+  BYTE *shellcode = new BYTE[totalSize];
+  memset(shellcode, 0, totalSize);
+
+  size_t offset = 0;
+  BYTE *sc = shellcode;
+
+  DWORD64 flagAddr = (DWORD64)remoteMem + flagOffsetAligned;
+
+  // 保存易失性寄存器
+  sc[offset++] = 0x50;    // push rax
+  sc[offset++] = 0x51;    // push rcx
+  sc[offset++] = 0x52;    // push rdx
+  sc[offset++] = 0x41; sc[offset++] = 0x50;    // push r8
+  sc[offset++] = 0x41; sc[offset++] = 0x51;    // push r9
+  sc[offset++] = 0x41; sc[offset++] = 0x52;    // push r10
+  sc[offset++] = 0x41; sc[offset++] = 0x53;    // push r11
+
+  // sub rsp, 0x28 (影子空间)
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xEC; sc[offset++] = 0x28;
+
+  // mov rcx, <remoteData>  ; 函数参数
+  DWORD64 remoteDataAddr = (DWORD64)remoteData;
+  sc[offset++] = 0x48; sc[offset++] = 0xB9;
+  memcpy(&sc[offset], &remoteDataAddr, 8); offset += 8;
+
+  // mov rax, <func_remote>
+  DWORD64 funcAddr = (DWORD64)func_remote;
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &funcAddr, 8); offset += 8;
+
+  // call rax
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // add rsp, 0x28
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xC4; sc[offset++] = 0x28;
+
+  // 设置完成标志
+  // mov rax, <flagAddr>
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &flagAddr, 8); offset += 8;
+  // mov dword ptr [rax], 1
+  sc[offset++] = 0xC7; sc[offset++] = 0x00;
+  DWORD one = 1;
+  memcpy(&sc[offset], &one, 4); offset += 4;
+
+  // SuspendThread(GetCurrentThread())
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xEC; sc[offset++] = 0x28;
+  DWORD64 getCurrentThreadAddr = (DWORD64)pGetCurrentThread;
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &getCurrentThreadAddr, 8); offset += 8;
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+  sc[offset++] = 0x48; sc[offset++] = 0x89; sc[offset++] = 0xC1;    // mov rcx, rax
+  DWORD64 suspendThreadAddr = (DWORD64)pSuspendThread;
+  sc[offset++] = 0x48; sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &suspendThreadAddr, 8); offset += 8;
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+  sc[offset++] = 0x48; sc[offset++] = 0x83; sc[offset++] = 0xC4; sc[offset++] = 0x28;
+
+  // 恢复寄存器
+  sc[offset++] = 0x41; sc[offset++] = 0x5B;    // pop r11
+  sc[offset++] = 0x41; sc[offset++] = 0x5A;    // pop r10
+  sc[offset++] = 0x41; sc[offset++] = 0x59;    // pop r9
+  sc[offset++] = 0x41; sc[offset++] = 0x58;    // pop r8
+  sc[offset++] = 0x5A;    // pop rdx
+  sc[offset++] = 0x59;    // pop rcx
+  sc[offset++] = 0x58;    // pop rax
+
+  // 跳回原始 IP（push + ret 方式，不破坏寄存器）
+  DWORD origIP_low = (DWORD)(origIP & 0xFFFFFFFF);
+  DWORD origIP_high = (DWORD)(origIP >> 32);
+  sc[offset++] = 0x68;
+  memcpy(&sc[offset], &origIP_low, 4); offset += 4;
+  sc[offset++] = 0xC7; sc[offset++] = 0x44; sc[offset++] = 0x24; sc[offset++] = 0x04;
+  memcpy(&sc[offset], &origIP_high, 4); offset += 4;
+  sc[offset++] = 0xC3;
+
+  RDCASSERT(offset <= shellcodeMaxSize, offset, shellcodeMaxSize);
+
+  void *remoteFlagAddr = (BYTE *)remoteMem + flagOffsetAligned;
+
+#else
+  // x86 shellcode
+  const size_t shellcodeMaxSize = 128;
+  const size_t flagOffsetAligned = (shellcodeMaxSize + 3) & ~(size_t)3;
+  const size_t totalSize = flagOffsetAligned + sizeof(DWORD);
+
+  void *remoteMem = VirtualAllocEx(hProcess, NULL, totalSize, MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+  if(!remoteMem)
+  {
+    RDCERR("InjectFunctionCall: couldn't allocate remote memory for shellcode: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteData, 0, MEM_RELEASE);
+    ResumeThread(hThread);
+    CloseHandle(hThread);
+    return;
+  }
+
+  BYTE *shellcode = new BYTE[totalSize];
+  memset(shellcode, 0, totalSize);
+
+  size_t offset = 0;
+  BYTE *sc = shellcode;
+
+  DWORD flagAddr = (DWORD)((uintptr_t)remoteMem + flagOffsetAligned);
+
+  // pushad + pushfd
+  sc[offset++] = 0x60;
+  sc[offset++] = 0x9C;
+
+  // push <remoteData>  ; 函数参数
+  DWORD remoteDataAddrX86 = (DWORD)(uintptr_t)remoteData;
+  sc[offset++] = 0x68;
+  memcpy(&sc[offset], &remoteDataAddrX86, 4); offset += 4;
+
+  // mov eax, <func_remote>
+  DWORD funcAddrX86 = (DWORD)(uintptr_t)func_remote;
+  sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &funcAddrX86, 4); offset += 4;
+
+  // call eax
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // 设置完成标志
+  sc[offset++] = 0xC7; sc[offset++] = 0x05;
+  memcpy(&sc[offset], &flagAddr, 4); offset += 4;
+  DWORD one = 1;
+  memcpy(&sc[offset], &one, 4); offset += 4;
+
+  // SuspendThread(GetCurrentThread())
+  DWORD getCurrentThreadAddrX86 = (DWORD)(uintptr_t)pGetCurrentThread;
+  sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &getCurrentThreadAddrX86, 4); offset += 4;
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+  sc[offset++] = 0x50;    // push eax
+  DWORD suspendThreadAddrX86 = (DWORD)(uintptr_t)pSuspendThread;
+  sc[offset++] = 0xB8;
+  memcpy(&sc[offset], &suspendThreadAddrX86, 4); offset += 4;
+  sc[offset++] = 0xFF; sc[offset++] = 0xD0;
+
+  // popfd + popad
+  sc[offset++] = 0x9D;
+  sc[offset++] = 0x61;
+
+  // 跳回原始 IP
+  sc[offset++] = 0x68;
+  memcpy(&sc[offset], &origIP, 4); offset += 4;
+  sc[offset++] = 0xC3;
+
+  RDCASSERT(offset <= shellcodeMaxSize, offset, shellcodeMaxSize);
+
+  void *remoteFlagAddr = (BYTE *)remoteMem + flagOffsetAligned;
+
+#endif
+
+  // 写入 shellcode
+  BOOL success = WriteProcessMemory(hProcess, remoteMem, shellcode, totalSize, NULL);
+  delete[] shellcode;
+
+  if(!success)
+  {
+    RDCERR("InjectFunctionCall: couldn't write shellcode: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, remoteData, 0, MEM_RELEASE);
+    ResumeThread(hThread);
+    CloseHandle(hThread);
+    return;
+  }
+
+  // 修改线程上下文
+#if ENABLED(RDOC_X64)
+  ctx.Rip = (DWORD64)remoteMem;
+#else
+  ctx.Eip = (DWORD)(uintptr_t)remoteMem;
+#endif
+
+  if(!SetThreadContext(hThread, &ctx))
+  {
+    RDCERR("InjectFunctionCall: SetThreadContext failed: %u", GetLastError());
+    VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+    VirtualFreeEx(hProcess, remoteData, 0, MEM_RELEASE);
+    ResumeThread(hThread);
+    CloseHandle(hThread);
+    return;
+  }
+
+  // 恢复线程执行 shellcode。
+  // 线程当前的挂起计数可能 > 1（来自之前的 SuspendThread + FindMainThread 的 SuspendThread），
+  // 需要循环 ResumeThread 直到线程真正运行。
+  {
+    DWORD suspCount;
+    do {
+      suspCount = ResumeThread(hThread);
+    } while(suspCount > 1);
+  }
+
+  // 等待函数调用完成
+  const DWORD timeout = 30000;
+  DWORD elapsed = 0;
+  bool completed = false;
+
+  while(elapsed < timeout)
+  {
+    Sleep(10);
+    elapsed += 10;
+
+    DWORD flagValue = 0;
+    SIZE_T bytesRead = 0;
+    if(ReadProcessMemory(hProcess, remoteFlagAddr, &flagValue, sizeof(flagValue), &bytesRead))
+    {
+      if(flagValue == 1)
+      {
+        completed = true;
+        break;
+      }
+    }
+  }
+
+  if(!completed)
+  {
+    RDCWARN("InjectFunctionCall: timed out waiting for %s to complete", funcName);
+  }
+
+  // 读回函数执行后的数据
+  ReadProcessMemory(hProcess, remoteData, data, dataLen, &numWritten);
+
+  // shellcode 已经通过 SuspendThread(GetCurrentThread()) 挂起了自身。
+  // 我们需要恢复线程让它继续执行恢复寄存器和跳回原始 IP 的代码，
+  // 然后再次等待它到达原始 IP 后挂起（为下一次 InjectFunctionCall 做准备）。
+  // 但由于 shellcode 跳回原始 IP 后线程就自由运行了，
+  // 我们不能在这里再次挂起（会有竞态）。
+  // 所以我们不恢复线程，让它保持挂起状态。
+  // 下一次 InjectFunctionCall 或最终的 ResumeThread 会处理恢复。
+  //
+  // 但是这样线程的 IP 还在 shellcode 中（SuspendThread 返回后的位置），
+  // 我们需要手动设置线程上下文回到原始 IP。
+  CONTEXT restoreCtx = {};
+  restoreCtx.ContextFlags = CONTEXT_FULL;
+  GetThreadContext(hThread, &restoreCtx);
+
+  // 恢复原始上下文（在 shellcode 开始前保存的）
+  // 由于 shellcode 已经挂起，我们直接设置回原始 IP
+#if ENABLED(RDOC_X64)
+  restoreCtx.Rip = origIP;
+  // 恢复原始上下文中保存的寄存器值
+  restoreCtx.Rax = ctx.Rax;
+  restoreCtx.Rcx = ctx.Rcx;
+  restoreCtx.Rdx = ctx.Rdx;
+  restoreCtx.R8 = ctx.R8;
+  restoreCtx.R9 = ctx.R9;
+  restoreCtx.R10 = ctx.R10;
+  restoreCtx.R11 = ctx.R11;
+  restoreCtx.Rsp = ctx.Rsp;    // 恢复原始栈指针
+#else
+  restoreCtx.Eip = origIP;
+  restoreCtx.Eax = ctx.Eax;
+  restoreCtx.Ecx = ctx.Ecx;
+  restoreCtx.Edx = ctx.Edx;
+  restoreCtx.Ebx = ctx.Ebx;
+  restoreCtx.Esp = ctx.Esp;
+  restoreCtx.Ebp = ctx.Ebp;
+  restoreCtx.Esi = ctx.Esi;
+  restoreCtx.Edi = ctx.Edi;
+#endif
+  SetThreadContext(hThread, &restoreCtx);
+
+  // 清理 shellcode 内存（线程已经不在 shellcode 中了）
   VirtualFreeEx(hProcess, remoteMem, 0, MEM_RELEASE);
+  VirtualFreeEx(hProcess, remoteData, 0, MEM_RELEASE);
+
+  // 线程保持挂起状态，等待下一次操作或最终恢复
+  CloseHandle(hThread);
 }
 
 static PROCESS_INFORMATION RunProcess(const rdcstr &app, const rdcstr &workingDir,
@@ -1183,8 +2025,13 @@ rdcpair<RDResult, uint32_t> Process::LaunchAndInjectIntoProcess(
   rdcpair<RDResult, uint32_t> ret = InjectIntoProcess(pi.dwProcessId, {}, capturefile, opts, false);
 
   CloseHandle(pi.hProcess);
-  ResumeThread(pi.hThread);
-  ResumeThread(pi.hThread);
+  // 恢复线程：InjectIntoProcess 完成后，线程处于挂起状态（挂起计数 = 1）。
+  // 这个挂起来自最后一次 InjectFunctionCall 中 shellcode 的 SuspendThread(GetCurrentThread())。
+  // 需要一次 ResumeThread 使线程运行。使用循环确保安全。
+  DWORD suspCount;
+  do {
+    suspCount = ResumeThread(pi.hThread);
+  } while(suspCount > 1);
 
   if(ret.second == 0 || ret.first != ResultCode::Succeeded)
   {
