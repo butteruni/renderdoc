@@ -573,6 +573,25 @@ public:
     GetD3D11On12On7.Register("d3d11on12.dll", "GetD3D11On12On7Interface",
                              GetD3D11On12On7Interface_hook);
 
+    // 同时为 D3D12Core.dll 注册 hook，以拦截通过 Agility SDK 加载的 D3D12 函数。
+    // 当游戏使用 D3D12 Agility SDK 时，D3D12CreateDevice 等函数实际上是从 D3D12Core.dll
+    // 导出的，而不是 d3d12.dll。如果不注册 D3D12Core.dll 的 hook，游戏通过
+    // GetProcAddress(D3D12Core_module, "D3D12CreateDevice") 获取的函数指针将绕过 RenderDoc 的拦截。
+    // 这里不传 orig 指针（使用 NULL），因为我们已经从 d3d12.dll 获取了原始函数指针。
+    LibraryHooks::RegisterLibraryHook("d3d12core.dll", NULL);
+    LibraryHooks::RegisterFunctionHook(
+        "d3d12core.dll", FunctionHook("D3D12CreateDevice", NULL, (void *)D3D12CreateDevice_hook));
+    LibraryHooks::RegisterFunctionHook(
+        "d3d12core.dll",
+        FunctionHook("D3D12GetDebugInterface", NULL, (void *)D3D12GetDebugInterface_hook));
+    LibraryHooks::RegisterFunctionHook(
+        "d3d12core.dll",
+        FunctionHook("D3D12GetInterface", NULL, (void *)D3D12GetInterface_hook));
+    LibraryHooks::RegisterFunctionHook(
+        "d3d12core.dll",
+        FunctionHook("D3D12EnableExperimentalFeatures", NULL,
+                     (void *)D3D12EnableExperimentalFeatures_hook));
+
     m_RecurseSlot = Threading::AllocateTLSSlot();
     Threading::SetTLSValue(m_RecurseSlot, NULL);
   }
