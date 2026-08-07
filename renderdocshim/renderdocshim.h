@@ -34,8 +34,8 @@ struct ShimData
 
 #ifdef WIN64
 #define GLOBAL_HOOK_DATA_NAME "RenderTestGlobalHookData64"
-#define SHIM_DLL_NAME "rendertestshim64.dll"
+#define SHIM_DLL_NAME "gfxdiagshim64.dll"
 #else
 #define GLOBAL_HOOK_DATA_NAME "RenderTestGlobalHookData32"
-#define SHIM_DLL_NAME "rendertestshim32.dll"
+#define SHIM_DLL_NAME "gfxdiagshim32.dll"
 #endif
